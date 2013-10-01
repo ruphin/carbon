@@ -1,4 +1,5 @@
 import time
+import json
 
 from twisted.internet import reactor
 from twisted.internet.protocol import DatagramProtocol
@@ -115,8 +116,9 @@ class MetricPickleReceiver(MetricReceiver, Int32StringReceiver):
       self.metricReceived(metric, datapoint)
 
 
-class CacheManagementHandler(Int32StringReceiver):
+class CacheManagementHandler(LineOnlyReceiver):
   MAX_LENGTH = 1024 ** 3 # 1mb
+  delimiter = ';'
 
   def connectionMade(self):
     peer = self.transport.getPeer()
@@ -130,19 +132,19 @@ class CacheManagementHandler(Int32StringReceiver):
     else:
       log.query("%s connection lost: %s" % (self.peerAddr, reason.value))
 
-  def stringReceived(self, rawRequest):
-    request = self.unpickler.loads(rawRequest)
-    if request['type'] == 'cache-query':
-      metric = request['metric']
-      datapoints = MetricCache.get(metric, [])
+  def lineReceived(self, rawRequest):
+    log.query('[%s] query received: %s' % (self.peerAddr, rawRequest))
+    request_type, request = rawRequest.split('|', 1)
+    if request_type == 'cache-query':
+      datapoints = MetricCache.get(request, [])
       result = dict(datapoints=datapoints)
       if settings.LOG_CACHE_HITS:
-        log.query('[%s] cache query for \"%s\" returned %d values' % (self.peerAddr, metric, len(datapoints)))
+        log.query('[%s] cache query for \"%s\" returned %d values' % (self.peerAddr, request, len(datapoints)))
       instrumentation.increment('cacheQueries')
 
-    elif request['type'] == 'cache-query-bulk':
+    elif request_type == 'cache-query-bulk':
       datapointsByMetric = {}
-      metrics = request['metrics']
+      metrics = request.split('|')
       for metric in metrics:
         datapointsByMetric[metric] = MetricCache.get(metric, [])
 
@@ -154,17 +156,14 @@ class CacheManagementHandler(Int32StringReceiver):
       instrumentation.increment('cacheBulkQueries')
       instrumentation.append('cacheBulkQuerySize', len(metrics))
 
-    elif request['type'] == 'get-metadata':
-      result = management.getMetadata(request['metric'], request['key'])
-
-    elif request['type'] == 'set-metadata':
-      result = management.setMetadata(request['metric'], request['key'], request['value'])
+    elif request_type == 'get-metadata':
+      metric, key = request.split('|')
+      result = management.getMetadata(metric, key)
 
     else:
-      result = dict(error="Invalid request type \"%s\"" % request['type'])
+      result = dict(error="Invalid request type \"%s\"" % request_type)
 
-    response = pickle.dumps(result, protocol=-1)
-    self.sendString(response)
+    self.sendLine(json.dumps(result))
 
 
 # Avoid import circularities
